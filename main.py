@@ -6,306 +6,340 @@ import os
 import zipfile as zf
 import xml.etree.ElementTree as ET
 
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 load_dotenv()
 
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-logger = logging.getLogger("fusion_ess_extractor")
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fusion Account Analysis Report Extractor")
+app = FastAPI(
+    title="Fusion Account Analysis Report Extractor"
+)
 
 
 class ReportRequest(BaseModel):
-    document_content: str = Field(
-        ...,
-        description="Base64-encoded ZIP DocumentContent for Account Analysis Report.",
-    )
+    request_id: int
+
+
+FUSION_BASE_URL = os.getenv(
+    "FUSION_BASE_URL",
+    "https://iaaley-test.fa.ocs.oraclecloud.com"
+)
+
+FUSION_USERNAME = os.getenv("FUSION_USERNAME")
+FUSION_PASSWORD = os.getenv("FUSION_PASSWORD")
 
 
 def _to_number(value):
     if value is None:
-        return None
+        return 0.0
+
+    value = str(value).strip()
+
+    if not value:
+        return 0.0
+
+    value = value.replace(",", "")
 
     try:
-        return float(str(value).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return None
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
 
 
-def _decode_base64(document_content: str) -> bytes:
-    logger.info(
-        "Decoding base64 document content (%d chars)",
-        len(document_content)
-    )
+def _decode_base64(document_content):
+    if not document_content:
+        raise ValueError("DocumentContent is empty")
+
+    if isinstance(document_content, bytes):
+        document_content = document_content.decode("utf-8")
+
+    document_content = document_content.strip()
 
     try:
-        decoded = base64.b64decode(
+        return base64.b64decode(
             document_content,
-            validate=True
+            validate=False
         )
     except (binascii.Error, ValueError) as exc:
-        logger.error(
-            "Failed to decode base64 document content: %s",
-            exc
-        )
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid base64 document_content: {exc}"
-        )
+        raise ValueError(
+            f"Invalid Base64 DocumentContent: {exc}"
+        ) from exc
 
-    logger.info(
-        "Decoded document content: %d bytes",
-        len(decoded)
+
+def _find_xml_entry(zip_file):
+    xml_files = [
+        name
+        for name in zip_file.namelist()
+        if name.lower().endswith(".xml")
+    ]
+
+    if not xml_files:
+        raise ValueError("No XML file found inside the downloaded ZIP")
+
+    return xml_files[0]
+
+
+def _parse_ccid(elem):
+    code_combination = (
+        elem.findtext("ACCOUNTING_CODE_COMBINATION")
+        or ""
+    ).strip()
+
+    beginning_debit = _to_number(
+        elem.findtext("ACCT_SUM_BAL_DR")
     )
 
-    return decoded
-
-
-def _find_xml_entry(zip_file: zf.ZipFile) -> str:
-    for name in zip_file.namelist():
-        if name.lower().endswith(".xml"):
-            return name
-
-    raise HTTPException(
-        status_code=422,
-        detail="No XML file found inside ZIP"
+    beginning_credit = _to_number(
+        elem.findtext("ACCT_SUM_BAL_CR")
     )
 
-
-def _validate_account_analysis(
-    zip_file: zf.ZipFile,
-    xml_name: str
-) -> None:
-
-    with zip_file.open(xml_name) as stream:
-        head = stream.read(65536)
-
-    head_text = head.decode(
-        "utf-8",
-        errors="replace"
+    period_debit = _to_number(
+        elem.findtext("ACCT_SUM_PR_DR")
     )
 
-    if "XLAAARPT" not in head_text:
-        raise HTTPException(
-            status_code=422,
-            detail="XML does not contain XLAAARPT. Expected Account Analysis Report."
-        )
-
-    logger.info(
-        "Detected Account Analysis Report (XLAAARPT)"
+    period_credit = _to_number(
+        elem.findtext("ACCT_SUM_PR_CR")
     )
 
-
-def _parse_ccid(elem) -> dict:
-
-    code_combination = elem.findtext(
-        ".//ACCOUNTING_CODE_COMBINATION"
-    )
-
-    begin_dr = _to_number(
-        elem.findtext(".//ACCT_SUM_BAL_DR")
-    ) or 0.0
-
-    begin_cr = _to_number(
-        elem.findtext(".//ACCT_SUM_BAL_CR")
-    ) or 0.0
-
-    period_dr = _to_number(
-        elem.findtext(".//ACCT_SUM_PR_DR")
-    ) or 0.0
-
-    period_cr = _to_number(
-        elem.findtext(".//ACCT_SUM_PR_CR")
-    ) or 0.0
-
-    begin_net = begin_dr - begin_cr
-
-    if begin_net >= 0:
-        begin_balance_dr = begin_net
-        begin_balance_cr = 0.0
-    else:
-        begin_balance_dr = 0.0
-        begin_balance_cr = -begin_net
-
-    period_net = period_dr - period_cr
-
-    ending_net = begin_net + period_net
-
-    if ending_net >= 0:
-        ending_balance_dr = ending_net
-        ending_balance_cr = 0.0
-    else:
-        ending_balance_dr = 0.0
-        ending_balance_cr = -ending_net
+    ending_debit = beginning_debit + period_debit
+    ending_credit = beginning_credit + period_credit
 
     items = []
 
-    for jeline in elem.findall(".//JELINE_ROW"):
-
+    for line in elem.findall(".//JELINE_ROW"):
         source = (
-            jeline.findtext(".//JE_SOURCE_NAME")
-            or jeline.findtext(".//APPLICATION_NAME")
+            line.findtext("JE_SOURCE_NAME")
+            or line.findtext("APPLICATION_NAME")
+            or ""
+        ).strip()
+
+        transaction_number = (
+            line.findtext("TRANSACTION_NUMBER")
+            or line.findtext("DOCUMENT_SEQUENCE_NUMBER")
+            or ""
+        ).strip()
+
+        accounted_debit = _to_number(
+            line.findtext("ACCOUNTED_DR")
         )
 
-        number = (
-            jeline.findtext(".//TRANSACTION_NUMBER")
-            or jeline.findtext(".//DOCUMENT_SEQUENCE_NUMBER")
+        accounted_credit = _to_number(
+            line.findtext("ACCOUNTED_CR")
         )
-
-        debit = _to_number(
-            jeline.findtext(".//ACCOUNTED_DR")
-        ) or 0.0
-
-        credit = _to_number(
-            jeline.findtext(".//ACCOUNTED_CR")
-        ) or 0.0
 
         items.append({
             "source": source,
-            "number": number,
-            "debitBalance": round(debit, 2),
-            "creditBalance": round(credit, 2)
+            "transactionNumber": transaction_number,
+            "accountedDebit": accounted_debit,
+            "accountedCredit": accounted_credit
         })
 
     return {
         "codeCombination": code_combination,
-        "beginBalance_debit": round(begin_balance_dr, 2),
-        "beginBalance_credit": round(begin_balance_cr, 2),
-        "periodBalance_debit": round(period_dr, 2),
-        "periodBalance_credit": round(period_cr, 2),
-        "endingBalance_debit": round(ending_balance_dr, 2),
-        "endingBalance_credit": round(ending_balance_cr, 2),
+        "beginningDebit": beginning_debit,
+        "beginningCredit": beginning_credit,
+        "periodDebit": period_debit,
+        "periodCredit": period_credit,
+        "endingDebit": ending_debit,
+        "endingCredit": ending_credit,
         "items": items
     }
 
 
-def _stream_parse_account_analysis(stream) -> list:
-
+def _stream_parse_account_analysis(xml_stream):
     results = []
 
-    found_any = False
-
     for event, elem in ET.iterparse(
-        stream,
+        xml_stream,
         events=("end",)
     ):
+        if elem.tag == "CCID_S":
+            record = _parse_ccid(elem)
 
-        if elem.tag != "CCID_S":
-            continue
+            if record["codeCombination"]:
+                results.append(record)
 
-        found_any = True
-
-        record = _parse_ccid(elem)
-
-        results.append(record)
-
-        elem.clear()
-
-    if not found_any:
-        logger.error(
-            "Account Analysis XML had no CCID_S rows"
-        )
-
-        raise HTTPException(
-            status_code=422,
-            detail="Account Analysis XML had no CCID_S rows"
-        )
-
-    logger.info(
-        "Parsed %d Account Analysis records",
-        len(results)
-    )
+            elem.clear()
 
     return results
 
 
-def _get_account_analysis_records(
-    document_content: str
-):
+def _fetch_document_content(request_id):
+    if not FUSION_USERNAME or not FUSION_PASSWORD:
+        raise RuntimeError(
+            "FUSION_USERNAME and FUSION_PASSWORD "
+            "must be configured"
+        )
+
+    url = (
+        f"{FUSION_BASE_URL}"
+        "/fscmRestApi/resources/11.13.18.05/erpintegrations"
+    )
+
+    params = {
+        "fields": "DocumentContent",
+        "finder": (
+            f"ESSJobExecutionDetailsRF;"
+            f"requestId={request_id},"
+            f"fileType=ALL"
+        )
+    }
+
+    logger.info(
+        "Fetching DocumentContent for ESS request ID %s",
+        request_id
+    )
+
+    response = requests.get(
+        url,
+        params=params,
+        auth=(FUSION_USERNAME, FUSION_PASSWORD),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        },
+        timeout=180
+    )
+
+    if response.status_code != 200:
+        logger.error(
+            "Fusion API failed. Status=%s Response=%s",
+            response.status_code,
+            response.text[:1000]
+        )
+
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "message": "Failed to fetch DocumentContent from Oracle Fusion",
+                "fusion_status": response.status_code,
+                "fusion_response": response.text[:1000]
+            }
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Oracle Fusion returned a non-JSON response"
+        ) from exc
+
+    document_content = data.get("DocumentContent")
+
+    if not document_content:
+        items = data.get("items", [])
+
+        if items:
+            document_content = items[0].get(
+                "DocumentContent"
+            )
+
+    if not document_content:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "DocumentContent not found",
+                "request_id": request_id,
+                "response": data
+            }
+        )
+
+    return document_content
+
+
+def _get_account_analysis_records(request_id):
+    document_content = _fetch_document_content(
+        request_id
+    )
 
     zip_bytes = _decode_base64(
         document_content
     )
 
     try:
-
         with zf.ZipFile(
-            io.BytesIO(zip_bytes),
-            "r"
+            io.BytesIO(zip_bytes)
         ) as zip_file:
 
-            xml_name = _find_xml_entry(
+            xml_entry = _find_xml_entry(
                 zip_file
             )
 
             logger.info(
-                "Using XML file: %s",
-                xml_name
-            )
-
-            _validate_account_analysis(
-                zip_file,
-                xml_name
+                "Processing XML file: %s",
+                xml_entry
             )
 
             with zip_file.open(
-                xml_name
-            ) as stream:
+                xml_entry
+            ) as xml_stream:
 
-                records = _stream_parse_account_analysis(
-                    stream
+                records = (
+                    _stream_parse_account_analysis(
+                        xml_stream
+                    )
                 )
 
     except zf.BadZipFile as exc:
-
-        logger.error(
-            "Invalid ZIP document: %s",
-            exc
-        )
-
         raise HTTPException(
             status_code=422,
-            detail="DocumentContent is not a valid ZIP file"
-        )
+            detail=(
+                "DocumentContent was decoded successfully "
+                "but is not a valid ZIP file"
+            )
+        ) from exc
 
     return records
 
 
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "service": "Fusion Account Analysis Report Extractor"
+    }
+
+
 @app.post("/report")
-def get_report(payload: ReportRequest):
+def report(request: ReportRequest):
+    try:
+        records = _get_account_analysis_records(
+            request.request_id
+        )
 
-    logger.info(
-        "Received Account Analysis Report request"
-    )
+        items_count = sum(
+            len(record["items"])
+            for record in records
+        )
 
-    records = _get_account_analysis_records(
-        payload.document_content
-    )
-
-    items_count = sum(
-        len(record.get("items", []))
-        for record in records
-    )
-
-    logger.info(
-        "Returning %d Account Analysis records",
-        len(records)
-    )
-
-    return JSONResponse(
-        content={
+        return {
             "report_name": "Account Analysis Report",
+            "request_id": request.request_id,
             "count": len(records),
             "items_count": items_count,
             "data": records
         }
-    )
 
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Unexpected error processing request ID %s",
+            request.request_id
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc)
+        ) from exc
