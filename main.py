@@ -88,6 +88,7 @@ def _find_xml_entry(zip_file):
     return xml_files[0]
 
 
+
 def _parse_ccid(elem):
     code_combination = (
         elem.findtext("ACCOUNTING_CODE_COMBINATION")
@@ -113,18 +114,12 @@ def _parse_ccid(elem):
     ending_debit = beginning_debit + period_debit
     ending_credit = beginning_credit + period_credit
 
-    items = []
+    source_totals = {}
 
     for line in elem.findall(".//JELINE_ROW"):
         source = (
             line.findtext("JE_SOURCE_NAME")
             or line.findtext("APPLICATION_NAME")
-            or ""
-        ).strip()
-
-        transaction_number = (
-            line.findtext("TRANSACTION_NUMBER")
-            or line.findtext("DOCUMENT_SEQUENCE_NUMBER")
             or ""
         ).strip()
 
@@ -136,12 +131,28 @@ def _parse_ccid(elem):
             line.findtext("ACCOUNTED_CR")
         )
 
-        items.append({
-            "source": source,
-            "transactionNumber": transaction_number,
-            "accountedDebit": accounted_debit,
-            "accountedCredit": accounted_credit
-        })
+        if source not in source_totals:
+            source_totals[source] = {
+                "source": source,
+                "TotalDebit": 0.0,
+                "TotalCredit": 0.0
+            }
+
+        source_totals[source]["TotalDebit"] += accounted_debit
+        source_totals[source]["TotalCredit"] += accounted_credit
+
+    items = list(source_totals.values())
+
+    for item in items:
+        item["TotalDebit"] = round(
+            item["TotalDebit"],
+            2
+        )
+
+        item["TotalCredit"] = round(
+            item["TotalCredit"],
+            2
+        )
 
     return {
         "codeCombination": code_combination,
@@ -153,7 +164,6 @@ def _parse_ccid(elem):
         "endingCredit": ending_credit,
         "items": items
     }
-
 
 def _stream_parse_account_analysis(xml_stream):
     results = []
